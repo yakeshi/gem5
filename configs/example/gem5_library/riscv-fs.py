@@ -39,6 +39,13 @@ Characteristics
   password: `root`)
 """
 
+import argparse
+import os
+import m5
+import m5.util
+
+m5.util.addToPath("../../")
+
 from gem5.components.boards.riscv_board import RiscvBoard
 from gem5.components.memory import SingleChannelDDR3_1600
 from gem5.components.processors.simple_processor import SimpleProcessor
@@ -49,45 +56,105 @@ from gem5.components.cachehierarchies.classic.\
 from gem5.components.processors.cpu_types import CPUTypes
 from gem5.isas import ISA
 from gem5.utils.requires import requires
-from gem5.resources.resource import Resource
+from gem5.resources.resource import Resource, CustomResource
 from gem5.simulate.simulator import Simulator
+from gem5.simulate.exit_event import ExitEvent
+from common import SysPaths
 
 # Run a check to ensure the right version of gem5 is being used.
 requires(isa_required=ISA.RISCV)
 
-# Setup the cache hierarchy.
-# For classic, PrivateL1PrivateL2 and NoCache have been tested.
-# For Ruby, MESI_Two_Level and MI_example have been tested.
-cache_hierarchy = PrivateL1PrivateL2CacheHierarchy(
-    l1d_size="32KiB", l1i_size="32KiB", l2_size="512KiB"
-)
+default_disk = 'riscv-disk-img'
+default_kernel = 'riscv-bootloader-vmlinux-5.10'
 
-# Setup the system memory.
-memory = SingleChannelDDR3_1600()
+cpu_types = {
+    "atomic" : CPUTypes.ATOMIC,
+    "timing" : CPUTypes.TIMING,
+    "minor"  : CPUTypes.MINOR,
+    "o3"     : CPUTypes.O3,
+    "kvm"    : CPUTypes.KVM,
+}
 
-# Setup a single core Processor.
-processor = SimpleProcessor(
-    cpu_type=CPUTypes.TIMING, isa=ISA.RISCV, num_cores=1
-)
+def addOptions(parser):
+    parser.add_argument("--restore-from", type=str, default=None,
+                        help="Restore from checkpoint")
+    parser.add_argument("--kernel", type=str, default=None,
+                        help="Linux kernel")
+    parser.add_argument("--disk", type=str, default=None,
+                        help="Disks to instantiate")
+    parser.add_argument("--cpu-type", type=str, choices=list(cpu_types.keys()),
+                        default="timing",
+                        help="CPU simulation mode. Default: %(default)s")
+    return parser
 
-# Setup the board.
-board = RiscvBoard(
-    clk_freq="1GHz",
-    processor=processor,
-    memory=memory,
-    cache_hierarchy=cache_hierarchy,
-)
+def instantiate(options):
+    """Instantiate Simulator object."""
+    cache_hierarchy = PrivateL1PrivateL2CacheHierarchy(
+        l1d_size="32KiB", l1i_size="32KiB", l2_size="512KiB")
+    # Setup the system memory.
+    memory = SingleChannelDDR3_1600()
 
-# Set the Full System workload.
-board.set_kernel_disk_workload(
-                   kernel=Resource("riscv-bootloader-vmlinux-5.10"),
-                   disk_image=Resource("riscv-disk-img"),
-)
+    # Setup a single core Processor.
+    processor = SimpleProcessor(
+        cpu_type=cpu_types[options.cpu_type],
+        isa=ISA.RISCV,
+        num_cores=1)
 
-simulator = Simulator(board=board)
-print("Beginning simulation!")
-# Note: This simulation will never stop. You can access the terminal upon boot
-# using m5term (`./util/term`): `./m5term localhost <port>`. Note the `<port>`
-# value is obtained from the gem5 terminal stdout. Look out for
-# "system.platform.terminal: Listening for connections on port <port>".
-simulator.run()
+    # Setup the board.
+    board = RiscvBoard(
+        clk_freq="1GHz",
+        processor=processor,
+        memory=memory,
+        cache_hierarchy=cache_hierarchy)
+
+    if options.kernel is None or len(options.kernel) == 0:
+        kernel = Resource(default_kernel)
+    elif os.path.isabs(options.kernel):
+        kernel = CustomResource(local_path=options.kernel)
+    else:
+        kernel = CustomResource(local_path=SysPaths.binary(options.kernel))
+
+    if options.disk is None or len(options.disk) == 0:
+        disk = Resource(default_disk)
+    elif os.path.isabs(options.disk):
+        disk = CustomResource(local_path=options.disk)
+    else:
+        disk = CustomResource(local_path=SysPaths.disk(options.disk))
+
+    # Set the Full System workload.
+    board.set_kernel_disk_workload(kernel=kernel, disk_image=disk)
+
+    # Set checkpoint path
+    if options.restore_from:
+        if not os.path.isabs(options.restore_from):
+            cpt = options.restore_from
+        else:
+            cpt = os.path.abspath(options.restore_from)
+            if not os.path.isdir(cpt):
+                cpt = os.path.join(m5.options.outdir, options.restore_from)
+        if not os.path.isdir(cpt):
+            raise IOError("Can't find checkpoint directory")
+        simulator = Simulator(board=board, checkpoint_path=cpt)
+    else:
+        simulator = Simulator(board=board)
+
+    return simulator
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generic RISC-V Full System configuration")
+    addOptions(parser)
+    options = parser.parse_args()
+    simulator = instantiate(options)
+    print("Beginning simulation!")
+    simulator.run()
+    exit_cause = simulator.get_last_exit_event_cause()
+    print('last exit event: %s' % exit_cause)
+    exit_enum = ExitEvent.translate_exit_status(exit_cause)
+    if exit_enum is ExitEvent.CHECKPOINT:
+        simulator.save_checkpoint(m5.options.outdir)
+        print('Saved checkpoint')
+
+
+if __name__ == "__m5_main__":
+    main()
